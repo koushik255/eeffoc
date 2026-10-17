@@ -1,0 +1,25 @@
+[project]
+name = "eeffoc"
+version = "0.1.0"
+description = "Exact-panel manga search: benchmark and models"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "faiss-cpu>=1.9,<2",
+    "numpy>=2.2,<3",
+    "opencv-python-headless>=4.10,<5",
+    "pillow>=11,<13",
+    "torch>=2.8,<3",
+    "torchvision>=0.23,<1",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

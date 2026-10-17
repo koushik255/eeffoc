@@ -1,0 +1,332 @@
+"""Search systems compared by the benchmark.
+
+All of them see pages and queries in grey (the index is colour-blind on
+purpose: Steel Ball Run also exists in black and white) and get queries the
+way a site would: shrunk to UPLOAD_SIDE on the long side, JPEG 90.
+
+  sift     RootSIFT features of every page in one FAISS index; each query
+           feature votes for the page of its nearest neighbour (ratio test
+           against the nearest other page), then the best 20 pages are
+           checked with RANSAC.
+  curtain  curtain's combined-rocm-50k-v1 ResNet-18, exactly as the movie
+           site uses it: 49 shared-trunk tiles + whole page, query + 4 pieces.
+  sscd     Meta's SSCD (sscd_disc_mixup, ResNet-50) zero-shot, with the
+           same tiles and pieces (each tile run separately).
+  *+align  the embedding's top 10 re-ordered by SIFT + RANSAC, as on curtain.
+"""
+
+from __future__ import annotations
+
+import io
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import cv2
+import faiss
+import numpy as np
+import torch
+import torch.nn.functional as functional
+from PIL import Image
+from torch import nn
+from torchvision.models import resnet18
+
+from bench import catalog as catalogs
+from bench.catalog import LOCAL, PAGES
+
+INDEX = LOCAL / "index"
+# Curtain-architecture checkpoints (ResNet-18 + 128-d head), by system name.
+CHECKPOINTS = {
+    "curtain": Path.home() / "curtain/.local/trained_models/combined-rocm-50k-v1/best.pt",
+}
+SSCD_MODEL = LOCAL / "models/sscd_disc_mixup.torchscript.pt"
+UPLOAD_SIDE = 1024
+TOP = 10
+GRID = 4                    # tiles per side of a page
+STEPS = 2 * GRID - 1        # half-stride tile positions per side: 7 x 7 = 49 tiles
+WHOLE_HANDICAP = 0.1        # curtain's: a whole-query match counts 0.1 less than the piece mean
+SIFT_PAGE_SIDE = 1280       # pages are described at this long side
+SIFT_QUERY_SIDE = 1024
+SIFT_FEATURES = 3000
+RATIO = 0.8
+VERIFIED_POINTS = 15        # RANSAC inliers that count as a confirmed match
+IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
+IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
+POOL = ThreadPoolExecutor(16)
+
+
+def jpeg(image: Image.Image, quality: int) -> Image.Image:
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=quality)
+    return Image.open(io.BytesIO(buffer.getvalue()))
+
+
+def upload(image: Image.Image) -> Image.Image:
+    # What a browser would send: at most UPLOAD_SIDE on the long side, JPEG 90, then grey.
+    scale = UPLOAD_SIDE / max(image.size)
+    if scale < 1:
+        image = image.resize((round(image.width * scale), round(image.height * scale)), Image.BILINEAR)
+    return jpeg(image, 90).convert("L")
+
+
+def catalog(set_name: str) -> list[dict]:
+    return catalogs.load(set_name)
+
+
+def checkpoint(name: str) -> Path:
+    """A named checkpoint, or a fine-tuned run in .local/runs/<name>/best.pt."""
+    return CHECKPOINTS.get(name, LOCAL / "runs" / name / "best.pt")
+
+
+def page_grey(page: dict) -> Image.Image:
+    with Image.open(PAGES / page["path"]) as image:
+        return image.convert("L")
+
+
+def pieces(image: Image.Image) -> list[Image.Image]:
+    """curtain's four overlapping corner pieces, each 60% of the width and height."""
+    w, h = image.size
+    pw, ph = int(w * 0.6), int(h * 0.6)
+    return [image.crop((x, y, x + pw, y + ph)) for y in (0, h - ph) for x in (0, w - pw)]
+
+
+def tensor(image: Image.Image) -> torch.Tensor:
+    # Grey PIL image -> [1, 3, H, W] float in 0..1.
+    array = torch.from_numpy(np.asarray(image.convert("L"), dtype=np.uint8).copy())
+    return array.float().div_(255)[None, None].expand(1, 3, -1, -1)
+
+
+def normalized(images: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    images = functional.interpolate(images, size=size, mode="bilinear", align_corners=False, antialias=True)
+    return (images - IMAGENET_MEAN.to(images.device)) / IMAGENET_STD.to(images.device)
+
+
+def rank_tiles(vectors: np.ndarray, queries: np.ndarray) -> list[int]:
+    """curtain's scoring. vectors: [pages, 50, d], queries: [views, d] with
+    the whole query first. A page scores the better of the mean over views
+    (crops match piece by piece) and the whole query minus WHOLE_HANDICAP."""
+    best = np.einsum("ptd,vd->ptv", vectors, queries).max(axis=1)  # [pages, views]
+    score = np.maximum(best[:, 0] - WHOLE_HANDICAP, best.mean(axis=1))
+    return np.argsort(-score)[:TOP].tolist()
+
+
+# ------------------------------------------------------------------ SIFT
+
+def sift(grey: np.ndarray, side: int) -> tuple[np.ndarray, np.ndarray]:
+    """RootSIFT points (in the resized image's pixels) and descriptors."""
+    scale = min(1.0, side / max(grey.shape))
+    if scale < 1:
+        grey = cv2.resize(grey, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    keypoints, descriptors = cv2.SIFT_create(nfeatures=SIFT_FEATURES).detectAndCompute(grey, None)
+    if descriptors is None:
+        return np.zeros((0, 2), np.float32), np.zeros((0, 128), np.float32)
+    descriptors /= descriptors.sum(axis=1, keepdims=True) + 1e-7
+    return np.float32([k.pt for k in keypoints]), np.sqrt(descriptors).astype(np.float32)
+
+
+class SiftPages:
+    """Every page's SIFT features, cached in .local/index/<set>."""
+
+    def __init__(self, pages: list[dict], set_name: str):
+        path = INDEX / set_name / f"sift-{SIFT_PAGE_SIDE}-{SIFT_FEATURES}.npz"
+        if not path.exists():
+            started = time.perf_counter()
+            found = list(POOL.map(lambda p: sift(np.asarray(page_grey(p)), SIFT_PAGE_SIDE), pages))
+            counts = np.array([len(f[0]) for f in found])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(path, points=np.concatenate([f[0] for f in found]),
+                     descriptors=np.concatenate([f[1] for f in found]).astype(np.float16),
+                     offsets=np.concatenate([[0], np.cumsum(counts)]))
+            print(f"  SIFT for {len(pages)} pages in {time.perf_counter() - started:.0f}s", flush=True)
+        data = np.load(path)
+        self.points, self.offsets = data["points"], data["offsets"]
+        self.descriptors = data["descriptors"]  # fp16; a page's rows become fp32 when matched
+        self.owner = np.repeat(np.arange(len(pages)), np.diff(self.offsets))
+
+    def of(self, page: int) -> tuple[np.ndarray, np.ndarray]:
+        a, b = self.offsets[page], self.offsets[page + 1]
+        return self.points[a:b], self.descriptors[a:b].astype(np.float32)
+
+    def inliers(self, query: tuple[np.ndarray, np.ndarray], page: int) -> int:
+        """Matches that agree on one affine map from the query into the page."""
+        (qp, qd), (pp, pd) = query, self.of(page)
+        if len(qd) < 4 or len(pd) < 4:
+            return 0
+        pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(qd, pd, k=2)
+        good = [m for m, n in (p for p in pairs if len(p) == 2) if m.distance < RATIO * n.distance]
+        if len(good) < 6:
+            return len(good) // 2
+        matrix, mask = cv2.estimateAffine2D(qp[[m.queryIdx for m in good]], pp[[m.trainIdx for m in good]],
+                                            method=cv2.RANSAC, ransacReprojThreshold=6.0)
+        return int(mask.sum()) if matrix is not None else 0
+
+    def rerank(self, query: tuple[np.ndarray, np.ndarray], candidates: list[int]) -> list[int]:
+        """Confirmed pages (VERIFIED_POINTS+ inliers) first, most inliers first;
+        the rest keep their order."""
+        points = list(POOL.map(lambda c: self.inliers(query, c), candidates))
+        confirmed = sorted((i for i, n in enumerate(points) if n >= VERIFIED_POINTS), key=lambda i: -points[i])
+        return [candidates[i] for i in confirmed] + [c for i, c in enumerate(candidates) if i not in confirmed]
+
+
+def system_sift(pages: list[dict], sift_pages: SiftPages):
+    started = time.perf_counter()
+    quantizer = faiss.IndexFlatL2(128)
+    index = faiss.IndexIVFFlat(quantizer, 128, 2048)
+    sample = np.random.default_rng(0).choice(len(sift_pages.descriptors), 200_000, replace=False)
+    index.train(sift_pages.descriptors[sample].astype(np.float32))
+    for start in range(0, len(sift_pages.descriptors), 1 << 20):
+        index.add(sift_pages.descriptors[start:start + (1 << 20)].astype(np.float32))
+    index.nprobe = 24
+    print(f"  FAISS over {index.ntotal:,} SIFT features in {time.perf_counter() - started:.0f}s", flush=True)
+
+    def run(image: Image.Image) -> list[int]:
+        query = sift(np.asarray(image), SIFT_QUERY_SIDE)
+        if len(query[1]) == 0:
+            return []
+        distances, ids = index.search(query[1], 8)
+        owners = np.where(ids >= 0, sift_pages.owner[np.maximum(ids, 0)], -1)
+        # Ratio test against the nearest neighbour on a different page (squared distances).
+        other = (owners != owners[:, :1]) & (owners >= 0)
+        second = np.where(other.any(axis=1), distances[np.arange(len(ids)), other.argmax(axis=1)], np.inf)
+        keep = (owners[:, 0] >= 0) & (distances[:, 0] < RATIO ** 2 * second)
+        votes = np.bincount(owners[keep, 0], minlength=len(pages))
+        candidates = np.argsort(-votes, kind="stable")[:20].tolist()
+        return sift_pages.rerank(query, candidates)[:TOP]
+    return run
+
+
+# ------------------------------------------------------------------ curtain
+
+class CurtainEncoder(nn.Module):
+    # Same layout as curtain_ml.model.CurtainEncoder, so its checkpoint loads as is.
+    def __init__(self, embedding_dim: int, image_size: int):
+        super().__init__()
+        self.image_size = image_size
+        self.backbone = resnet18(weights=None)
+        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, embedding_dim)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return functional.normalize(self.backbone(images), dim=1)
+
+    def trunk(self, images: torch.Tensor) -> torch.Tensor:
+        b = self.backbone
+        for layer in (b.conv1, b.bn1, b.relu, b.maxpool, b.layer1, b.layer2, b.layer3, b.layer4):
+            images = layer(images)
+        return images
+
+
+def load_curtain(path: Path) -> CurtainEncoder:
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    config = saved["config"]
+    model = CurtainEncoder(int(config["embedding_dim"]), int(config["image_size"]))
+    model.load_state_dict(saved["model"])
+    return model.eval()
+
+
+def curtain_page(model: CurtainEncoder, page: Image.Image) -> np.ndarray:
+    """[50, 128]: 49 tiles from one trunk pass at 4 x 192 (rcmindex's way), then the whole page.
+    Like curtain, the page is squashed to a square."""
+    size = model.image_size
+    image = tensor(page).to(next(model.parameters()).device)
+    features = model.trunk(normalized(image, (GRID * size, GRID * size)))[0]
+    cells = features.shape[-1] // GRID
+    stride = cells // 2
+    pooled = torch.stack([features[:, y * stride:y * stride + cells, x * stride:x * stride + cells].mean((1, 2))
+                          for y in range(STEPS) for x in range(STEPS)])
+    tiles = functional.normalize(model.backbone.fc(pooled), dim=1)
+    whole = model(normalized(image, (size, size)))
+    return torch.cat([tiles, whole]).float().cpu().numpy()
+
+
+def curtain_views(model: CurtainEncoder, image: Image.Image) -> np.ndarray:
+    size = model.image_size
+    views = [image, *pieces(image)]
+    device = next(model.parameters()).device
+    return model(torch.cat([normalized(tensor(v).to(device), (size, size)) for v in views])).float().cpu().numpy()
+
+
+# ------------------------------------------------------------------ SSCD
+
+SSCD_SIDE = 288  # SSCD's evaluation size: the short side resized to 288
+
+
+def sscd_size(w: int, h: int) -> tuple[int, int]:
+    scale = SSCD_SIDE / min(w, h)
+    return round(h * scale), round(w * scale)
+
+
+def sscd_embed(model, images: list[Image.Image]) -> torch.Tensor:
+    # Images of one size, keeping their aspect ratio (SSCD isn't trained on squashed inputs).
+    size = sscd_size(*images[0].size)
+    batch = torch.cat([normalized(tensor(i), size) for i in images])
+    return functional.normalize(model(batch), dim=1)
+
+
+def sscd_page_per_tile(model, page: Image.Image) -> np.ndarray:
+    """[50, 512]: the 49 half-stride tiles, each run separately, then the whole page.
+    The reference for sscd_page; ~10 s a page on CPU."""
+    w, h = page.size
+    tw, th = w // GRID, h // GRID
+    tiles = [page.crop((round(x * tw / 2), round(y * th / 2), round(x * tw / 2) + tw, round(y * th / 2) + th))
+             for y in range(STEPS) for x in range(STEPS)]
+    return torch.cat([sscd_embed(model, tiles), sscd_embed(model, [page])]).numpy()
+
+
+def sscd_page(model, page: Image.Image) -> np.ndarray:
+    """[50, 512] like sscd_page_per_tile, from one trunk pass at GRID x the tile
+    size: GeM-pool each tile's window of the feature map, then SSCD's head."""
+    th, tw = sscd_size(page.width // GRID, page.height // GRID)
+    features = model.backbone(normalized(tensor(page), (GRID * th, GRID * tw)))
+    fh, fw = features.shape[-2:]
+    rows = [(round(y * fh / (2 * GRID)), round((y + 2) * fh / (2 * GRID))) for y in range(STEPS)]
+    cols = [(round(x * fw / (2 * GRID)), round((x + 2) * fw / (2 * GRID))) for x in range(STEPS)]
+    tiles = torch.cat([model.embeddings(features[:, :, r0:r1, c0:c1]) for r0, r1 in rows for c0, c1 in cols])
+    return torch.cat([tiles, sscd_embed(model, [page])]).numpy()
+
+
+def sscd_views(model, image: Image.Image) -> np.ndarray:
+    return torch.cat([sscd_embed(model, [image]), sscd_embed(model, pieces(image))]).numpy()
+
+
+# ------------------------------------------------------------------ embedding systems
+
+def page_vectors(name: str, set_name: str, pages: list[dict], embed_page) -> np.ndarray:
+    """[pages, 50, d] float32, cached in .local/index/<set>/<name>.npy."""
+    path = INDEX / set_name / f"{name}.npy"
+    if path.exists():
+        return np.load(path)
+    started = time.perf_counter()
+    out = []
+    with torch.inference_mode():
+        for i, page in enumerate(pages):
+            out.append(embed_page(page_grey(page)))
+            if (i + 1) % 100 == 0:
+                rate = (i + 1) / (time.perf_counter() - started)
+                print(f"  {name}: {i + 1}/{len(pages)} pages, {rate:.1f}/s", flush=True)
+    vectors = np.stack(out).astype(np.float32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, vectors)
+    print(f"  {name}: {len(pages)} pages in {time.perf_counter() - started:.0f}s", flush=True)
+    return vectors
+
+
+def system_embedding(name: str, set_name: str, pages: list[dict], sift_pages: SiftPages | None,
+                     align_top: int = 0):
+    """name: "sscd", or a curtain-architecture checkpoint (see checkpoint())."""
+    if name == "sscd":
+        model = torch.jit.load(str(SSCD_MODEL), map_location="cpu").eval()
+        embed_page, embed_views = (lambda p: sscd_page(model, p)), (lambda i: sscd_views(model, i))
+    else:
+        model = load_curtain(checkpoint(name))
+        embed_page, embed_views = (lambda p: curtain_page(model, p)), (lambda i: curtain_views(model, i))
+    vectors = page_vectors(name, set_name, pages, embed_page)
+
+    def run(image: Image.Image) -> list[int]:
+        with torch.inference_mode():
+            queries = embed_views(image)
+        found = rank_tiles(vectors, queries)
+        if align_top:
+            query = sift(np.asarray(image), SIFT_QUERY_SIDE)
+            found = sift_pages.rerank(query, found[:align_top]) + found[align_top:]
+        return found
+    return run
