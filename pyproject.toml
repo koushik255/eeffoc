@@ -8,18 +8,28 @@ dependencies = [
     "numpy>=2.2,<3",
     "opencv-python-headless>=4.10,<5",
     "pillow>=11,<13",
-    "torch>=2.8,<3",
-    "torchvision>=0.23,<1",
 ]
+
+# One of these picks torch's build: `uv sync --extra cpu`, or `--extra cuda`
+# on a machine with an NVIDIA GPU (CUDA 13, driver 580 or newer).
+[project.optional-dependencies]
+cpu = ["torch>=2.8,<3", "torchvision>=0.23,<1"]
+cuda = ["torch>=2.8,<3", "torchvision>=0.23,<1"]
 
 [tool.uv]
 package = false
+conflicts = [[{ extra = "cpu" }, { extra = "cuda" }]]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cpu" }
-torchvision = { index = "pytorch-cpu" }
+torch = [{ index = "pytorch-cpu", extra = "cpu" }, { index = "pytorch-cu130", extra = "cuda" }]
+torchvision = [{ index = "pytorch-cpu", extra = "cpu" }, { index = "pytorch-cu130", extra = "cuda" }]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true

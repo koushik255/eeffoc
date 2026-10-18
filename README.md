@@ -44,10 +44,36 @@ often catch two pages). Every shown page SIFT confirms gets an outline of
 the part of the screenshot that matched it: red on the match, blue on a
 neighbour.
 
+### Building an index on a GPU machine
+
+`bench.gpu` embeds pages on a machine with an NVIDIA GPU for the machine
+that has `.local`, like a serverless GPU: the GPU machine needs only the
+repo, no pages, index or checkpoints, and searches always run locally.
+There:
+
+```sh
+uv sync --extra cuda                                      # CUDA 13 torch: NVIDIA driver 580 or newer
+.venv/bin/python -m bench.gpu --host 127.0.0.1 --port 8800
+```
+
+Here, with a tunnel to it (`ssh -L 8813:127.0.0.1:8800 gpu-box`), any
+command that has an index to build takes `EEFFOC_GPU`:
+
+```sh
+EEFFOC_GPU=http://127.0.0.1:8813 .venv/bin/python -m bench.run --suite sbr-v3 --systems manga-ft1+fine
+```
+
+The client sends the model's weights once, then each page's file, and gets
+its vectors back. On an RTX 4060 over Tailscale, the fine index of Steel
+Ball Run (3,630 pages) took 5 minutes, against ~41 on the 16-core CPU.
+Vectors differ from CPU-built ones by at most 0.001; searching sbr-v3 with
+either gives the same first page on all 600 queries. The worker has no
+authentication, hence 127.0.0.1 and the tunnel.
+
 ## Benchmark
 
 ```sh
-uv sync
+uv sync --extra cpu                                             # or --extra cuda on an NVIDIA machine
 .venv/bin/python -m bench.catalog --set sbr                     # all of Steel Ball Run -> .local/pages
 .venv/bin/python -m bench.suite --set sbr --name sbr-v3         # 600 queries, 24 kinds (mangashot, test profile)
 .venv/bin/python -m bench.run --suite sbr-v3 --systems curtain manga-ft1 manga-ft1+views manga-ft1+views+align

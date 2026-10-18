@@ -88,18 +88,19 @@ def groups(image: Image.Image) -> list[list[Image.Image]]:
     return out
 
 
-def page_scores(vectors: np.ndarray, queries: np.ndarray) -> np.ndarray:
-    """curtain's score per page for one group. vectors: [pages, tiles, d],
-    queries: [views, d], whole view first: the better of the mean over views
-    and the whole view minus WHOLE_HANDICAP. One matrix multiply over all
-    tiles (torch's is ~4x faster than numpy's einsum here)."""
+def page_scores(vectors: torch.Tensor, queries: np.ndarray) -> np.ndarray:
+    """curtain's score per page for one group. vectors: [pages, tiles, d]
+    float32, on the CPU or GPU; queries: [views, d], whole view first: the
+    better of the mean over views and the whole view minus WHOLE_HANDICAP.
+    One matrix multiply over all tiles, on the vectors' device (on the CPU,
+    torch's is ~4x faster than numpy's einsum here)."""
     pages, tiles, dim = vectors.shape
-    flat = torch.from_numpy(np.ascontiguousarray(vectors, dtype=np.float32)).view(pages * tiles, dim)
-    best = (flat @ torch.from_numpy(np.asarray(queries, dtype=np.float32)).T).view(pages, tiles, -1).amax(dim=1)
-    return torch.maximum(best[:, 0] - WHOLE_HANDICAP, best.mean(dim=1)).numpy()
+    queries = torch.from_numpy(np.asarray(queries, dtype=np.float32)).to(vectors.device)
+    best = (vectors.view(pages * tiles, dim) @ queries.T).view(pages, tiles, -1).amax(dim=1)
+    return torch.maximum(best[:, 0] - WHOLE_HANDICAP, best.mean(dim=1)).cpu().numpy()
 
 
-def rank(vectors: np.ndarray, embedded: list[np.ndarray], top: int) -> list[int]:
+def rank(vectors: torch.Tensor, embedded: list[np.ndarray], top: int) -> list[int]:
     """Pages by their best group score."""
     score = np.max([page_scores(vectors, q) for q in embedded], axis=0)
     return np.argsort(-score)[:top].tolist()

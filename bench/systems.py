@@ -13,11 +13,16 @@ way a site would: shrunk to UPLOAD_SIDE on the long side, JPEG 90.
   sscd     Meta's SSCD (sscd_disc_mixup, ResNet-50) zero-shot, with the
            same tiles and pieces (each tile run separately).
   *+align  the embedding's top 10 re-ordered by SIFT + RANSAC, as on curtain.
+
+With an NVIDIA GPU (`uv sync --extra cuda`) the curtain-architecture model,
+the page vectors and the SIFT descriptor matching run on it (DEVICE); SIFT
+features, RANSAC and SSCD stay on the CPU.
 """
 
 from __future__ import annotations
 
 import io
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -55,6 +60,8 @@ STRONG_POINTS = 50          # this many on the first candidate: confirmed, the r
 IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
 POOL = ThreadPoolExecutor(16)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+GPU_WORKER = os.environ.get("EEFFOC_GPU")  # a bench.gpu worker (http://host:port) to build indexes on
 
 
 def jpeg(image: Image.Image, quality: int) -> Image.Image:
@@ -103,7 +110,7 @@ def normalized(images: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     return (images - IMAGENET_MEAN.to(images.device)) / IMAGENET_STD.to(images.device)
 
 
-def rank_tiles(vectors: np.ndarray, queries: np.ndarray) -> list[int]:
+def rank_tiles(vectors: torch.Tensor, queries: np.ndarray) -> list[int]:
     """curtain's scoring (bench.views.page_scores) for the query and its pieces."""
     return np.argsort(-views.page_scores(vectors, queries))[:TOP].tolist()
 
@@ -152,13 +159,11 @@ class SiftPages:
         (qp, qd), (pp, pd) = query, self.of(page)
         if len(qd) < 4 or len(pd) < 4:
             return 0, None, None
-        pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(qd, pd, k=2)
-        good = [m for m, n in (p for p in pairs if len(p) == 2) if m.distance < RATIO * n.distance]
-        if len(good) < 6:
-            return len(good) // 2, None, None
-        source = qp[[m.queryIdx for m in good]]
-        matrix, mask = cv2.estimateAffine2D(source, pp[[m.trainIdx for m in good]],
-                                            method=cv2.RANSAC, ransacReprojThreshold=6.0)
+        query_rows, page_rows = ratio_matches(qd, pd)
+        if len(query_rows) < 6:
+            return len(query_rows) // 2, None, None
+        source = qp[query_rows]
+        matrix, mask = cv2.estimateAffine2D(source, pp[page_rows], method=cv2.RANSAC, ransacReprojThreshold=6.0)
         if matrix is None:
             return 0, None, None
         return int(mask.sum()), matrix, source[mask.ravel() == 1]
@@ -177,6 +182,20 @@ class SiftPages:
         points = [first] + list(POOL.map(lambda c: self.inliers(query, c), candidates[1:]))
         confirmed = sorted((i for i, n in enumerate(points) if n >= VERIFIED_POINTS), key=lambda i: -points[i])
         return [candidates[i] for i in confirmed] + [c for i, c in enumerate(candidates) if i not in confirmed]
+
+
+def ratio_matches(query: np.ndarray, page: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(query rows, page rows): each query descriptor's nearest page descriptor,
+    kept when it's nearer than RATIO x the second nearest."""
+    if DEVICE.type == "cpu":
+        pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(query, page, k=2)
+        good = [m for m, n in (p for p in pairs if len(p) == 2) if m.distance < RATIO * n.distance]
+        return np.array([m.queryIdx for m in good], int), np.array([m.trainIdx for m in good], int)
+    # The same brute-force match as one distance matrix on the GPU (~3000 x 3000).
+    query, page = torch.from_numpy(query).to(DEVICE), torch.from_numpy(page).to(DEVICE)
+    distances, nearest = torch.cdist(query, page).topk(2, dim=1, largest=False)
+    keep = distances[:, 0] < RATIO * distances[:, 1]
+    return keep.nonzero()[:, 0].cpu().numpy(), nearest[keep, 0].cpu().numpy()
 
 
 def system_sift(pages: list[dict], sift_pages: SiftPages):
@@ -231,7 +250,7 @@ def load_curtain(path: Path) -> CurtainEncoder:
     config = saved["config"]
     model = CurtainEncoder(int(config["embedding_dim"]), int(config["image_size"]))
     model.load_state_dict(saved["model"])
-    return model.eval()
+    return model.to(DEVICE).eval()
 
 
 def curtain_page(model: CurtainEncoder, page: Image.Image, grids: tuple[int, ...] = (GRID,)) -> np.ndarray:
@@ -261,6 +280,13 @@ def curtain_views(model: CurtainEncoder, image: Image.Image, views: list[Image.I
     views = views or [image, *pieces(image)]
     device = next(model.parameters()).device
     return model(torch.cat([normalized(tensor(v).to(device), (size, size)) for v in views])).float().cpu().numpy()
+
+
+def curtain_groups(model: CurtainEncoder, image: Image.Image) -> list[np.ndarray]:
+    """Embeddings of each of bench.views' groups of views of the image, all in one forward pass."""
+    groups = views.groups(image)
+    embedded = curtain_views(model, image, [v for g in groups for v in g])
+    return np.split(embedded, np.cumsum([len(g) for g in groups])[:-1])
 
 
 # ------------------------------------------------------------------ SSCD
@@ -308,16 +334,21 @@ def sscd_views(model, image: Image.Image) -> np.ndarray:
 
 # ------------------------------------------------------------------ embedding systems
 
-def page_vectors(name: str, set_name: str, pages: list[dict], embed_page) -> np.ndarray:
-    """[pages, vectors per page, d] float32, cached in .local/index/<set>/<name>.npy."""
-    path = INDEX / set_name / f"{name}.npy"
+def vectors_path(name: str, set_name: str) -> Path:
+    return INDEX / set_name / f"{name}.npy"
+
+
+def page_vectors(name: str, set_name: str, pages: list[dict], embed_page, map_pages=map) -> np.ndarray:
+    """[pages, vectors per page, d] float32, cached in vectors_path(name, set_name).
+    embed_page(page dict) runs over the pages with map_pages (a worker's pool.map runs several at once)."""
+    path = vectors_path(name, set_name)
     if path.exists():
         return np.load(path)
     started = time.perf_counter()
     out = []
     with torch.inference_mode():
-        for i, page in enumerate(pages):
-            out.append(embed_page(page_grey(page)))
+        for i, vectors in enumerate(map_pages(embed_page, pages)):
+            out.append(vectors)
             if (i + 1) % 100 == 0:
                 rate = (i + 1) / (time.perf_counter() - started)
                 print(f"  {name}: {i + 1}/{len(pages)} pages, {rate:.1f}/s", flush=True)
@@ -333,24 +364,30 @@ def system_embedding(name: str, set_name: str, pages: list[dict], sift_pages: Si
     """name: "sscd", or a curtain-architecture checkpoint (see checkpoint()).
     extra_views: also search with the content crop, strip windows and halves (bench.views).
     fine: index pages with FINE_GRIDS instead of the 4 x 4 grid alone."""
-    if name == "sscd":
-        model = torch.jit.load(str(SSCD_MODEL), map_location="cpu").eval()
-        embed_page, embed_views = (lambda p: sscd_page(model, p)), (lambda i: sscd_views(model, i))
-    else:
-        model = load_curtain(checkpoint(name))
-        grids = FINE_GRIDS if fine else (GRID,)
-        embed_page, embed_views = (lambda p: curtain_page(model, p, grids)), (lambda i: curtain_views(model, i))
+    grids, map_pages = FINE_GRIDS if fine else (GRID,), map
     if (extra_views or fine) and name == "sscd":
         raise ValueError("extra views and fine tiles are only wired up for curtain-architecture models")
-    embed_group = lambda m, g: curtain_views(m, g[0], g)  # noqa: E731
-    vectors = page_vectors(name + ("-fine" if fine else ""), set_name, pages, embed_page)
+    if name == "sscd":
+        model = torch.jit.load(str(SSCD_MODEL), map_location="cpu").eval()
+        embed_page, embed_views = (lambda p: sscd_page(model, page_grey(p))), (lambda i: sscd_views(model, i))
+    else:
+        model = load_curtain(checkpoint(name))
+        embed_page = lambda p: curtain_page(model, page_grey(p), grids)  # noqa: E731
+        embed_views = lambda i: curtain_views(model, i)  # noqa: E731
+        embed_groups = lambda i: curtain_groups(model, i)  # noqa: E731
+    index_name = name + ("-fine" if fine else "")
+    if GPU_WORKER and name != "sscd" and not vectors_path(index_name, set_name).exists():
+        from bench.gpu import Worker  # build the index on the GPU machine; searches stay here
+        worker = Worker(GPU_WORKER, checkpoint(name), grids)
+        embed_page, map_pages = worker.page, worker.pool.map
+    # One tensor on DEVICE for the whole search (318 MB with fine tiles), scored there.
+    vectors = page_vectors(index_name, set_name, pages, embed_page, map_pages)
+    vectors = torch.from_numpy(vectors).to(DEVICE)
 
     def run(image: Image.Image) -> list[int]:
         with torch.inference_mode():
-            if extra_views:  # every group's views in one forward pass, then split back per group
-                groups = views.groups(image)
-                embedded = embed_group(model, [v for g in groups for v in g])
-                found = views.rank(vectors, np.split(embedded, np.cumsum([len(g) for g in groups])[:-1]), TOP)
+            if extra_views:
+                found = views.rank(vectors, embed_groups(image), TOP)
             else:
                 found = rank_tiles(vectors, embed_views(image))
         if align_top:
