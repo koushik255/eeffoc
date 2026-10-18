@@ -32,6 +32,18 @@ modal volume get eeffoc-training-data /runs/manga-ft1/best.pt .local/runs/manga-
 `manga-ft1`: 12 epochs on one L4 with 32 CPUs, ~3 min an epoch. Exact page
 on held-out Vagabond pages went from 55.5% to 95.5% (best at epoch 10).
 
+## Find a screenshot
+
+```sh
+.venv/bin/python -m bench.find shot.jpg other.png      # -> .local/found/<name>.jpg
+```
+
+Searches Steel Ball Run with manga-ft1 + fine tiles + views + SIFT check,
+then shows the matched page with the page before and after it (screenshots
+often catch two pages). Every shown page SIFT confirms gets an outline of
+the part of the screenshot that matched it: red on the match, blue on a
+neighbour.
+
 ## Benchmark
 
 ```sh
@@ -79,6 +91,24 @@ along strips, and the halves of landscape images (`bench/views.py`);
 
 Median search time (16-core CPU): curtain 121 ms, manga-ft1 157 ms, + views
 212 ms, + align 10 653 ms, + views + align 10 936 ms.
+
+**Fine tiles** ("+fine", 2026-10-18): a 6 x 6 grid indexed as well (11 x 11
+half-stride tiles, ~2.8% of the page each), 171 vectors a page instead of 50,
+one more trunk pass at 1152 px (0.68 s a page on CPU).
+
+| | manga-ft1 | + views | + views + align 10 |
+|---|---|---|---|
+| 4 x 4 tiles | 544 | 576 | 592 |
+| + 6 x 6 tiles | 539 | 578 | 595 |
+
+They find the tiny regions (tight crop 21 -> 25, panel 20 -> 21 with views;
+24/25 panels with align) but on their own add near misses elsewhere (browser,
+photo, mirrored), since the model only ever trained against 4 x 4 tiles.
+Left with fine + views + align (5): one thin panel, one mirrored crop, two
+scroll-reader shots where the next page fills most of the screen and the
+model returns that page, and one small social-post image. Counting the page
+before or after as a hit ("page or its neighbour", now in bench.run's
+report), those two scroll-reader shots count: 597/600.
 
 What's left with views + align (8 misses): tiny regions (a panel or tight
 crop of 5-6% of the page, smaller than an index tile), one mirrored crop,

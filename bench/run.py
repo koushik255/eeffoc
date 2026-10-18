@@ -4,10 +4,13 @@
     .venv/bin/python -m bench.run --suite sbr-v2 --systems curtain <run-name> <run-name>+align
 
 A system is "sift", "sscd", "curtain" or a fine-tuned run in .local/runs/<name>,
-with "+views" to also search with content crops, strip windows and halves
-(bench.views) and "+align" to re-order its top 10 by SIFT + RANSAC.
+with "+fine" to index a finer tile grid as well, "+views" to also search with
+content crops, strip windows and halves (bench.views) and "+align" to re-order
+its top 10 by SIFT + RANSAC.
 
-Scores per query: the right page first (exact), the right page in the top 10,
+Scores per query: the right page first (exact), the right page or the page
+before or after it first (neighbour: a site shows the match with the pages
+around it, and a screenshot often catches two), the right page in the top 10,
 the right volume first, the right series first. For two_page_view either
 page counts.
 """
@@ -32,29 +35,31 @@ LABELS = {"sift": "SIFT + RANSAC", "curtain": "curtain ResNet-18", "sscd": "SSCD
 
 def label(key: str) -> str:
     name, *extras = key.split("+")
-    names = {"views": " + views", "align": " + align 10"}
+    names = {"fine": " + fine tiles", "views": " + views", "align": " + align 10"}
     return LABELS.get(name, name) + "".join(names[e] for e in extras)
-METRICS = [("exact", "Exact page"), ("top10", "Right page in top 10"), ("volume", "Right volume"),
-           ("series", "Right series")]
+METRICS = [("exact", "Exact page"), ("neighbour", "Page or its neighbour"), ("top10", "Right page in top 10"),
+           ("volume", "Right volume"), ("series", "Right series")]
 
 
 def build(key: str, set_name: str, pages: list[dict], sift_pages):
     if key == "sift":
         return systems.system_sift(pages, sift_pages)
     name, *extras = key.split("+")
-    unknown = set(extras) - {"views", "align"}
+    unknown = set(extras) - {"fine", "views", "align"}
     if unknown:
         raise ValueError(f"unknown system modifier(s) {unknown} in {key}")
     return systems.system_embedding(name, set_name, pages, sift_pages, align_top=10 if "align" in extras else 0,
-                                    extra_views="views" in extras)
+                                    extra_views="views" in extras, fine="fine" in extras)
 
 
 def score(found: list[int], targets: list[int], pages: list[dict]) -> dict[str, bool]:
     if not found:
         return {m: False for m, _ in METRICS}
     first, target = pages[found[0]], pages[targets[0]]
+    same_volume = lambda t: (pages[t]["series"], pages[t]["volume"]) == (first["series"], first["volume"])
     return {
         "exact": found[0] in targets,
+        "neighbour": any(abs(found[0] - t) <= 1 and same_volume(t) for t in targets),
         "top10": any(t in found[:10] for t in targets),
         "volume": (first["series"], first["volume"]) == (target["series"], target["volume"]),
         "series": first["series"] == target["series"],

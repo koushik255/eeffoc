@@ -45,6 +45,7 @@ UPLOAD_SIDE = 1024
 TOP = 10
 GRID = 4                    # tiles per side of a page
 STEPS = 2 * GRID - 1        # half-stride tile positions per side: 7 x 7 = 49 tiles
+FINE_GRIDS = (4, 6)         # "+fine": also a 6 x 6 grid (11 x 11 = 121 tiles, ~2.8% of the page each)
 WHOLE_HANDICAP = 0.1        # curtain's: a whole-query match counts 0.1 less than the piece mean
 SIFT_PAGE_SIDE = 1280       # pages are described at this long side
 SIFT_QUERY_SIDE = 1024
@@ -148,18 +149,27 @@ class SiftPages:
         a, b = self.offsets[page], self.offsets[page + 1]
         return self.points[a:b], self.descriptors[a:b].astype(np.float32)
 
-    def inliers(self, query: tuple[np.ndarray, np.ndarray], page: int) -> int:
-        """Matches that agree on one affine map from the query into the page."""
+    def align(self, query: tuple[np.ndarray, np.ndarray], page: int):
+        """(inliers, matrix, matched): the affine map from query SIFT pixels to
+        the page's SIFT pixels (the page at SIFT_PAGE_SIDE) that most matches
+        agree on, and the query points of those matches."""
         (qp, qd), (pp, pd) = query, self.of(page)
         if len(qd) < 4 or len(pd) < 4:
-            return 0
+            return 0, None, None
         pairs = cv2.BFMatcher(cv2.NORM_L2).knnMatch(qd, pd, k=2)
         good = [m for m, n in (p for p in pairs if len(p) == 2) if m.distance < RATIO * n.distance]
         if len(good) < 6:
-            return len(good) // 2
-        matrix, mask = cv2.estimateAffine2D(qp[[m.queryIdx for m in good]], pp[[m.trainIdx for m in good]],
+            return len(good) // 2, None, None
+        source = qp[[m.queryIdx for m in good]]
+        matrix, mask = cv2.estimateAffine2D(source, pp[[m.trainIdx for m in good]],
                                             method=cv2.RANSAC, ransacReprojThreshold=6.0)
-        return int(mask.sum()) if matrix is not None else 0
+        if matrix is None:
+            return 0, None, None
+        return int(mask.sum()), matrix, source[mask.ravel() == 1]
+
+    def inliers(self, query: tuple[np.ndarray, np.ndarray], page: int) -> int:
+        """Matches that agree on one affine map from the query into the page."""
+        return self.align(query, page)[0]
 
     def rerank(self, query: tuple[np.ndarray, np.ndarray], candidates: list[int]) -> list[int]:
         """Confirmed pages (VERIFIED_POINTS+ inliers) first, most inliers first;
@@ -224,19 +234,25 @@ def load_curtain(path: Path) -> CurtainEncoder:
     return model.eval()
 
 
-def curtain_page(model: CurtainEncoder, page: Image.Image) -> np.ndarray:
-    """[50, 128]: 49 tiles from one trunk pass at 4 x 192 (rcmindex's way), then the whole page.
-    Like curtain, the page is squashed to a square."""
+def curtain_page(model: CurtainEncoder, page: Image.Image, grids: tuple[int, ...] = (GRID,)) -> np.ndarray:
+    """Tile vectors, then the whole page: [50, 128] for the default 4 x 4 grid.
+
+    For each grid g, one trunk pass at g x 192 (rcmindex's way) and the
+    (2g - 1)^2 half-stride windows of g x g cells. Like curtain, the page is
+    squashed to a square."""
     size = model.image_size
     image = tensor(page).to(next(model.parameters()).device)
-    features = model.trunk(normalized(image, (GRID * size, GRID * size)))[0]
-    cells = features.shape[-1] // GRID
-    stride = cells // 2
-    pooled = torch.stack([features[:, y * stride:y * stride + cells, x * stride:x * stride + cells].mean((1, 2))
-                          for y in range(STEPS) for x in range(STEPS)])
-    tiles = functional.normalize(model.backbone.fc(pooled), dim=1)
+    tiles = []
+    for grid in grids:
+        features = model.trunk(normalized(image, (grid * size, grid * size)))[0]
+        cells = features.shape[-1] // grid
+        stride = cells // 2
+        steps = 2 * grid - 1
+        pooled = torch.stack([features[:, y * stride:y * stride + cells, x * stride:x * stride + cells].mean((1, 2))
+                              for y in range(steps) for x in range(steps)])
+        tiles.append(functional.normalize(model.backbone.fc(pooled), dim=1))
     whole = model(normalized(image, (size, size)))
-    return torch.cat([tiles, whole]).float().cpu().numpy()
+    return torch.cat([*tiles, whole]).float().cpu().numpy()
 
 
 def curtain_views(model: CurtainEncoder, image: Image.Image, views: list[Image.Image] | None = None) -> np.ndarray:
@@ -293,7 +309,7 @@ def sscd_views(model, image: Image.Image) -> np.ndarray:
 # ------------------------------------------------------------------ embedding systems
 
 def page_vectors(name: str, set_name: str, pages: list[dict], embed_page) -> np.ndarray:
-    """[pages, 50, d] float32, cached in .local/index/<set>/<name>.npy."""
+    """[pages, vectors per page, d] float32, cached in .local/index/<set>/<name>.npy."""
     path = INDEX / set_name / f"{name}.npy"
     if path.exists():
         return np.load(path)
@@ -313,19 +329,21 @@ def page_vectors(name: str, set_name: str, pages: list[dict], embed_page) -> np.
 
 
 def system_embedding(name: str, set_name: str, pages: list[dict], sift_pages: SiftPages | None,
-                     align_top: int = 0, extra_views: bool = False):
+                     align_top: int = 0, extra_views: bool = False, fine: bool = False):
     """name: "sscd", or a curtain-architecture checkpoint (see checkpoint()).
-    extra_views: also search with the content crop, strip windows and halves (bench.views)."""
+    extra_views: also search with the content crop, strip windows and halves (bench.views).
+    fine: index pages with FINE_GRIDS instead of the 4 x 4 grid alone."""
     if name == "sscd":
         model = torch.jit.load(str(SSCD_MODEL), map_location="cpu").eval()
         embed_page, embed_views = (lambda p: sscd_page(model, p)), (lambda i: sscd_views(model, i))
     else:
         model = load_curtain(checkpoint(name))
-        embed_page, embed_views = (lambda p: curtain_page(model, p)), (lambda i: curtain_views(model, i))
-    if extra_views and name == "sscd":
-        raise ValueError("extra views are only wired up for curtain-architecture models")
+        grids = FINE_GRIDS if fine else (GRID,)
+        embed_page, embed_views = (lambda p: curtain_page(model, p, grids)), (lambda i: curtain_views(model, i))
+    if (extra_views or fine) and name == "sscd":
+        raise ValueError("extra views and fine tiles are only wired up for curtain-architecture models")
     embed_group = lambda m, g: curtain_views(m, g[0], g)  # noqa: E731
-    vectors = page_vectors(name, set_name, pages, embed_page)
+    vectors = page_vectors(name + ("-fine" if fine else ""), set_name, pages, embed_page)
 
     def run(image: Image.Image) -> list[int]:
         with torch.inference_mode():
