@@ -3,7 +3,9 @@
 Pages are copied byte for byte from the .cbz archives into
 .local/pages/<series>/<volume>/NNNN.<ext>, and .local/pages/catalog-<set>.json
 lists a set's pages in order: id, series, volume, archive member, size,
-colour or grey. Scanlation credit pages are skipped (they aren't the manga).
+colour or grey. Pages that aren't the manga are left out of the catalog:
+files named as credits, and the repeated credit, blank and colophon pages
+listed in bench/<set>-skip.json (a crop of one would match all its copies).
 
   v1    two volumes each of Steel Ball Run and Berserk (the first benchmark)
   sbr   all of Steel Ball Run: the test index. Never train on it.
@@ -62,7 +64,13 @@ def load(name: str) -> list[dict]:
     return json.loads(catalog_path(name).read_text())["pages"]
 
 
+def skipped(name: str) -> set[str]:
+    path = ROOT / "bench" / f"{name}-skip.json"
+    return set(json.loads(path.read_text())["members"]) if path.exists() else set()
+
+
 def build(name: str) -> None:
+    skip = skipped(name)
     pages = []
     for series, archives in SETS[name].items():
         for archive in archives:
@@ -72,7 +80,9 @@ def build(name: str) -> None:
             with zipfile.ZipFile(MANGA / archive) as cbz:
                 members = sorted(m for m in cbz.namelist()
                                  if Path(m).suffix.lower() in IMAGE_SUFFIXES and not SKIP.search(m))
-                for number, member in enumerate(members):
+                for number, member in enumerate(members):  # numbered before skipping: file names stay put
+                    if member in skip:
+                        continue
                     data = cbz.read(member)
                     path = out / f"{number:04d}{Path(member).suffix.lower()}"
                     if not path.exists():
@@ -82,7 +92,7 @@ def build(name: str) -> None:
                     pages.append({"id": len(pages), "series": series, "volume": volume,
                                   "path": str(path.relative_to(PAGES)), "member": member,
                                   "size": list(size), "colour": colour})
-            print(f"{series} {volume}: {len(members)} pages", flush=True)
+            print(f"{series} {volume}: {sum(m not in skip for m in members)} pages", flush=True)
     catalog_path(name).write_text(json.dumps({"set": name, "volumes": SETS[name], "pages": pages}, indent=1))
     colour = sum(p["colour"] for p in pages)
     print(f"{len(pages)} pages ({colour} colour) -> {catalog_path(name)}")

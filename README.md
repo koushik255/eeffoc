@@ -37,49 +37,62 @@ on held-out Vagabond pages went from 55.5% to 95.5% (best at epoch 10).
 ```sh
 uv sync
 .venv/bin/python -m bench.catalog --set sbr                     # all of Steel Ball Run -> .local/pages
-.venv/bin/python -m bench.suite --set sbr --name sbr-v2         # 600 queries, 24 kinds (mangashot, test profile)
-.venv/bin/python -m bench.run --suite sbr-v2 --systems curtain manga-ft1
+.venv/bin/python -m bench.suite --set sbr --name sbr-v3         # 600 queries, 24 kinds (mangashot, test profile)
+.venv/bin/python -m bench.run --suite sbr-v3 --systems curtain manga-ft1 manga-ft1+views manga-ft1+views+align
 ```
 
-### sbr-v2 results (2026-10-17)
+### sbr-v3 results (2026-10-18)
 
-All 3,726 Steel Ball Run pages indexed, 600 queries, exact page first.
-"+ align 10" re-orders the model's top 10 with SIFT + RANSAC, as curtain's
-site does.
+3,630 Steel Ball Run pages (the 96 repeated credit, blank and colophon pages
+in `bench/sbr-skip.json` left out), 600 queries, exact page first.
+"+ views" also searches with the manga cropped out of a screenshot, windows
+along strips, and the halves of landscape images (`bench/views.py`);
+"+ align 10" re-orders the top 10 with SIFT + RANSAC, as curtain's site does.
 
-| type | curtain | manga-ft1 | curtain + align 10 | manga-ft1 + align 10 |
-|---|---|---|---|---|
-| full_page | 25/25 | 25/25 | 25/25 | 25/25 |
-| wide_crop | 19/25 | 25/25 | 21/25 | 25/25 |
-| medium_crop | 23/25 | 25/25 | 24/25 | 25/25 |
-| tight_crop | 14/25 | 23/25 | 19/25 | 24/25 |
-| panel | 6/25 | 18/25 | 8/25 | 24/25 |
-| strip | 1/25 | 14/25 | 3/25 | 21/25 |
-| low_res | 16/25 | 25/25 | 22/25 | 25/25 |
-| heavy_compression | 23/25 | 25/25 | 24/25 | 25/25 |
-| upscaled | 16/25 | 24/25 | 21/25 | 24/25 |
-| greyscale | 24/25 | 25/25 | 25/25 | 25/25 |
-| colour_shift | 18/25 | 24/25 | 21/25 | 25/25 |
-| speech_bubbles | 15/25 | 25/25 | 21/25 | 25/25 |
-| watermark | 15/25 | 25/25 | 22/25 | 25/25 |
-| rotated | 16/25 | 25/25 | 19/25 | 25/25 |
-| mirrored | 3/25 | 23/25 | 6/25 | 24/25 |
-| stretched | 20/25 | 24/25 | 23/25 | 24/25 |
-| border | 8/25 | 25/25 | 14/25 | 25/25 |
-| scroll_reader | 3/25 | 23/25 | 4/25 | 24/25 |
-| paged_reader | 1/25 | 25/25 | 2/25 | 25/25 |
-| social_post | 0/25 | 19/25 | 1/25 | 21/25 |
-| chat | 0/25 | 16/25 | 0/25 | 18/25 |
-| browser | 0/25 | 21/25 | 1/25 | 25/25 |
-| photo | 0/25 | 19/25 | 1/25 | 22/25 |
-| two_page_view | 3/25 | 19/25 | 6/25 | 24/25 |
-| **all** | **269/600** | **542/600** | **333/600** | **575/600** |
-| median time | 77 ms | 75 ms | 470 ms | 476 ms |
+| type | curtain | manga-ft1 | manga-ft1 + views | manga-ft1 + align 10 | manga-ft1 + views + align 10 |
+|---|---|---|---|---|---|
+| full_page | 25/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| wide_crop | 18/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| medium_crop | 22/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| tight_crop | 15/25 | 24/25 | 21/25 | 25/25 | 24/25 |
+| panel | 5/25 | 16/25 | 20/25 | 22/25 | 22/25 |
+| strip | 1/25 | 14/25 | 23/25 | 21/25 | 25/25 |
+| low_res | 20/25 | 25/25 | 24/25 | 25/25 | 25/25 |
+| heavy_compression | 23/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| upscaled | 17/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| greyscale | 24/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| colour_shift | 19/25 | 24/25 | 23/25 | 25/25 | 25/25 |
+| speech_bubbles | 16/25 | 25/25 | 24/25 | 25/25 | 25/25 |
+| watermark | 13/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| rotated | 15/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| mirrored | 3/25 | 23/25 | 24/25 | 24/25 | 24/25 |
+| stretched | 21/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| border | 7/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| scroll_reader | 4/25 | 22/25 | 21/25 | 23/25 | 23/25 |
+| paged_reader | 1/25 | 25/25 | 25/25 | 25/25 | 25/25 |
+| social_post | 0/25 | 20/25 | 24/25 | 22/25 | 24/25 |
+| chat | 0/25 | 16/25 | 25/25 | 19/25 | 25/25 |
+| browser | 0/25 | 21/25 | 25/25 | 25/25 | 25/25 |
+| photo | 0/25 | 20/25 | 25/25 | 23/25 | 25/25 |
+| two_page_view | 1/25 | 19/25 | 22/25 | 25/25 | 25/25 |
+| **all** | 270/600 | 544/600 | 576/600 | 579/600 | 592/600 |
+
+Median search time (16-core CPU): curtain 121 ms, manga-ft1 157 ms, + views
+212 ms, + align 10 653 ms, + views + align 10 936 ms.
+
+What's left with views + align (8 misses): tiny regions (a panel or tight
+crop of 5-6% of the page, smaller than an index tile), one mirrored crop,
+two scroll-reader shots and one social post. The extra views cost a few
+plain crops (tight crop 24 -> 21 without align) where a white area makes
+the content detector crop too.
 
 The queries come from mangashot, which also made the training shots (the
 test profile only swaps layouts, fonts and captions), so this measures the
 kinds of screenshot we thought of. Real screenshots people take are the
 next test.
+
+On the earlier sbr-v2 suite (all 3,726 pages): curtain 269, manga-ft1 542,
+manga-ft1 + align 10 575 of 600.
 
 ### v1 results (2026-10-17)
 

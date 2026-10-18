@@ -32,6 +32,7 @@ from torch import nn
 from torchvision.models import resnet18
 
 from bench import catalog as catalogs
+from bench import views
 from bench.catalog import LOCAL, PAGES
 
 INDEX = LOCAL / "index"
@@ -238,9 +239,10 @@ def curtain_page(model: CurtainEncoder, page: Image.Image) -> np.ndarray:
     return torch.cat([tiles, whole]).float().cpu().numpy()
 
 
-def curtain_views(model: CurtainEncoder, image: Image.Image) -> np.ndarray:
+def curtain_views(model: CurtainEncoder, image: Image.Image, views: list[Image.Image] | None = None) -> np.ndarray:
+    """Embeddings of the query and its corner pieces, or of the given views."""
     size = model.image_size
-    views = [image, *pieces(image)]
+    views = views or [image, *pieces(image)]
     device = next(model.parameters()).device
     return model(torch.cat([normalized(tensor(v).to(device), (size, size)) for v in views])).float().cpu().numpy()
 
@@ -311,20 +313,26 @@ def page_vectors(name: str, set_name: str, pages: list[dict], embed_page) -> np.
 
 
 def system_embedding(name: str, set_name: str, pages: list[dict], sift_pages: SiftPages | None,
-                     align_top: int = 0):
-    """name: "sscd", or a curtain-architecture checkpoint (see checkpoint())."""
+                     align_top: int = 0, extra_views: bool = False):
+    """name: "sscd", or a curtain-architecture checkpoint (see checkpoint()).
+    extra_views: also search with the content crop, strip windows and halves (bench.views)."""
     if name == "sscd":
         model = torch.jit.load(str(SSCD_MODEL), map_location="cpu").eval()
         embed_page, embed_views = (lambda p: sscd_page(model, p)), (lambda i: sscd_views(model, i))
     else:
         model = load_curtain(checkpoint(name))
         embed_page, embed_views = (lambda p: curtain_page(model, p)), (lambda i: curtain_views(model, i))
+    if extra_views and name == "sscd":
+        raise ValueError("extra views are only wired up for curtain-architecture models")
+    embed_group = lambda m, g: curtain_views(m, g[0], g)  # noqa: E731
     vectors = page_vectors(name, set_name, pages, embed_page)
 
     def run(image: Image.Image) -> list[int]:
         with torch.inference_mode():
-            queries = embed_views(image)
-        found = rank_tiles(vectors, queries)
+            if extra_views:
+                found = views.rank(vectors, [embed_group(model, g) for g in views.groups(image)], TOP)
+            else:
+                found = rank_tiles(vectors, embed_views(image))
         if align_top:
             query = sift(np.asarray(image), SIFT_QUERY_SIDE)
             found = sift_pages.rerank(query, found[:align_top]) + found[align_top:]

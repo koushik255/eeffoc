@@ -4,7 +4,8 @@
     .venv/bin/python -m bench.run --suite sbr-v2 --systems curtain <run-name> <run-name>+align
 
 A system is "sift", "sscd", "curtain" or a fine-tuned run in .local/runs/<name>,
-with "+align" to re-order its top 10 by SIFT + RANSAC.
+with "+views" to also search with content crops, strip windows and halves
+(bench.views) and "+align" to re-order its top 10 by SIFT + RANSAC.
 
 Scores per query: the right page first (exact), the right page in the top 10,
 the right volume first, the right series first. For two_page_view either
@@ -30,8 +31,9 @@ LABELS = {"sift": "SIFT + RANSAC", "curtain": "curtain ResNet-18", "sscd": "SSCD
 
 
 def label(key: str) -> str:
-    name, _, align = key.partition("+")
-    return LABELS.get(name, name) + (" + align 10" if align else "")
+    name, *extras = key.split("+")
+    names = {"views": " + views", "align": " + align 10"}
+    return LABELS.get(name, name) + "".join(names[e] for e in extras)
 METRICS = [("exact", "Exact page"), ("top10", "Right page in top 10"), ("volume", "Right volume"),
            ("series", "Right series")]
 
@@ -39,8 +41,12 @@ METRICS = [("exact", "Exact page"), ("top10", "Right page in top 10"), ("volume"
 def build(key: str, set_name: str, pages: list[dict], sift_pages):
     if key == "sift":
         return systems.system_sift(pages, sift_pages)
-    name, _, align = key.partition("+")
-    return systems.system_embedding(name, set_name, pages, sift_pages, align_top=10 if align else 0)
+    name, *extras = key.split("+")
+    unknown = set(extras) - {"views", "align"}
+    if unknown:
+        raise ValueError(f"unknown system modifier(s) {unknown} in {key}")
+    return systems.system_embedding(name, set_name, pages, sift_pages, align_top=10 if "align" in extras else 0,
+                                    extra_views="views" in extras)
 
 
 def score(found: list[int], targets: list[int], pages: list[dict]) -> dict[str, bool]:
