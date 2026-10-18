@@ -110,6 +110,12 @@ model returns that page, and one small social-post image. Counting the page
 before or after as a hit ("page or its neighbour", now in bench.run's
 report), those two scroll-reader shots count: 597/600.
 
+**Speedups** (same answers): the SIFT check stops after the first page when it
+alone gets 50+ agreeing points (57 of 60 sampled queries), pages are scored
+with one torch matrix multiply instead of numpy's einsum, and all of a
+query's views go through the model in one batch. fine + views: 249 -> 151 ms
+median; fine + views + align 10: 619 -> 238 ms (16-core CPU, 3,630 pages).
+
 What's left with views + align (8 misses): tiny regions (a panel or tight
 crop of 5-6% of the page, smaller than an index tile), one mirrored crop,
 two scroll-reader shots and one social post. The extra views cost a few

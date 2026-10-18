@@ -46,12 +46,12 @@ TOP = 10
 GRID = 4                    # tiles per side of a page
 STEPS = 2 * GRID - 1        # half-stride tile positions per side: 7 x 7 = 49 tiles
 FINE_GRIDS = (4, 6)         # "+fine": also a 6 x 6 grid (11 x 11 = 121 tiles, ~2.8% of the page each)
-WHOLE_HANDICAP = 0.1        # curtain's: a whole-query match counts 0.1 less than the piece mean
 SIFT_PAGE_SIDE = 1280       # pages are described at this long side
 SIFT_QUERY_SIDE = 1024
 SIFT_FEATURES = 3000
 RATIO = 0.8
 VERIFIED_POINTS = 15        # RANSAC inliers that count as a confirmed match
+STRONG_POINTS = 50          # this many on the first candidate: confirmed, the rest aren't checked
 IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1)
 POOL = ThreadPoolExecutor(16)
@@ -104,12 +104,8 @@ def normalized(images: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
 
 
 def rank_tiles(vectors: np.ndarray, queries: np.ndarray) -> list[int]:
-    """curtain's scoring. vectors: [pages, 50, d], queries: [views, d] with
-    the whole query first. A page scores the better of the mean over views
-    (crops match piece by piece) and the whole query minus WHOLE_HANDICAP."""
-    best = np.einsum("ptd,vd->ptv", vectors, queries).max(axis=1)  # [pages, views]
-    score = np.maximum(best[:, 0] - WHOLE_HANDICAP, best.mean(axis=1))
-    return np.argsort(-score)[:TOP].tolist()
+    """curtain's scoring (bench.views.page_scores) for the query and its pieces."""
+    return np.argsort(-views.page_scores(vectors, queries))[:TOP].tolist()
 
 
 # ------------------------------------------------------------------ SIFT
@@ -173,8 +169,12 @@ class SiftPages:
 
     def rerank(self, query: tuple[np.ndarray, np.ndarray], candidates: list[int]) -> list[int]:
         """Confirmed pages (VERIFIED_POINTS+ inliers) first, most inliers first;
-        the rest keep their order."""
-        points = list(POOL.map(lambda c: self.inliers(query, c), candidates))
+        the rest keep their order. When the first candidate alone gets
+        STRONG_POINTS (most queries), the others aren't checked."""
+        first = self.inliers(query, candidates[0])
+        if first >= STRONG_POINTS:
+            return candidates
+        points = [first] + list(POOL.map(lambda c: self.inliers(query, c), candidates[1:]))
         confirmed = sorted((i for i, n in enumerate(points) if n >= VERIFIED_POINTS), key=lambda i: -points[i])
         return [candidates[i] for i in confirmed] + [c for i, c in enumerate(candidates) if i not in confirmed]
 
@@ -347,8 +347,10 @@ def system_embedding(name: str, set_name: str, pages: list[dict], sift_pages: Si
 
     def run(image: Image.Image) -> list[int]:
         with torch.inference_mode():
-            if extra_views:
-                found = views.rank(vectors, [embed_group(model, g) for g in views.groups(image)], TOP)
+            if extra_views:  # every group's views in one forward pass, then split back per group
+                groups = views.groups(image)
+                embedded = embed_group(model, [v for g in groups for v in g])
+                found = views.rank(vectors, np.split(embedded, np.cumsum([len(g) for g in groups])[:-1]), TOP)
             else:
                 found = rank_tiles(vectors, embed_views(image))
         if align_top:
