@@ -5,6 +5,7 @@ description = "Exact-panel manga search: benchmark and models"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "faiss-cpu>=1.9,<2",
+    "libarchive-c>=5,<6",
     "numpy>=2.2,<3",
     "opencv-python-headless>=4.10,<5",
     "pillow>=11,<13",

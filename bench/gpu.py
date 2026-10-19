@@ -26,12 +26,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import itertools
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock
 from typing import ClassVar
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
@@ -44,9 +47,19 @@ from bench.catalog import PAGES
 
 MAX_BODY = 100 << 20  # bytes: the model is ~45 MB
 IN_FLIGHT = 4         # requests a client keeps going at once while indexing
+TIMEOUT = 120         # seconds a request may take (a page takes well under 1)
+RETRY_WAIT, MAX_WAIT = 5, 300  # seconds between tries when the worker can't be reached, doubling up to MAX_WAIT
+# Every request gets its own thread, but the model runs on this one: CUDA work from each new
+# thread leaks ~4 MB of memory on Windows (27 GB after 7,000 pages).
+GPU = ThreadPoolExecutor(1)
 
 
 # ------------------------------------------------------------------ worker (the GPU machine)
+
+def embed_page(model: systems.CurtainEncoder, image: Image.Image, grids: tuple[int, ...]) -> np.ndarray:
+    with torch.inference_mode():  # per thread, so here on GPU's
+        return systems.curtain_page(model, image, grids)
+
 
 class Handler(BaseHTTPRequestHandler):
     models: ClassVar[dict[str, systems.CurtainEncoder]] = {}  # by id, shared by every request
@@ -85,7 +98,7 @@ class Handler(BaseHTTPRequestHandler):
             model.load_state_dict(saved["state"])
         except Exception as error:  # noqa: BLE001 - whatever was sent, it isn't a model
             return self.send_error(400, f"not a model: {error}")
-        self.models[model_id] = model.to(systems.DEVICE).eval()
+        self.models[model_id] = GPU.submit(lambda: model.to(systems.DEVICE).eval()).result()
         print(json.dumps({"loaded": model_id}), flush=True)
         self.reply()
 
@@ -98,11 +111,10 @@ class Handler(BaseHTTPRequestHandler):
         model, out = self.models[model_id], io.BytesIO()
         try:
             image = Image.open(io.BytesIO(self.body())).convert("L")
-        except (ValueError, OSError) as error:  # too big, or PIL can't read it
+        except (ValueError, OSError, RuntimeError) as error:  # too big, or PIL can't read it
             return self.send_error(400, f"not an image: {error}")
         grids = tuple(int(g) for g in params.get("grids", ["4"])[0].split(","))
-        with torch.inference_mode():
-            np.save(out, systems.curtain_page(model, image, grids))
+        np.save(out, GPU.submit(embed_page, model, image, grids).result())
         self.reply(out.getvalue())
 
     def log_message(self, *args) -> None:  # one line a request is too many while indexing
@@ -123,18 +135,25 @@ def main() -> None:
 
 class Worker:
     """A bench.gpu worker at url, embedding pages with checkpoint the way
-    systems.curtain_page does locally."""
+    systems.curtain_page does locally. When the worker can't be reached (its
+    machine asleep, the tunnel down), requests wait and try again; when it
+    has restarted without the model, the model is sent again."""
 
     def __init__(self, url: str, checkpoint: Path, grids: tuple[int, ...]):
         self.url, self.grids = url.rstrip("/"), ",".join(map(str, grids))
-        self.id = hashlib.sha256(checkpoint.read_bytes()).hexdigest()[:16]
-        self.pool = ThreadPoolExecutor(IN_FLIGHT)
-        try:
-            self.request("GET", "model")
-        except HTTPError as error:
-            if error.code != 404:
-                raise
-            saved = torch.load(checkpoint, map_location="cpu", weights_only=False)  # our own checkpoint
+        self.checkpoint, self.id = checkpoint, hashlib.sha256(checkpoint.read_bytes()).hexdigest()[:16]
+        self.pool, self.sending = ThreadPoolExecutor(IN_FLIGHT), Lock()
+        self.send_model()
+
+    def send_model(self) -> None:
+        with self.sending:  # once, however many requests found it missing
+            try:
+                self.request("GET", "model")
+                return
+            except HTTPError as error:
+                if error.code != 404:
+                    raise
+            saved = torch.load(self.checkpoint, map_location="cpu", weights_only=False)  # our own checkpoint
             model = io.BytesIO()
             torch.save({"embedding_dim": int(saved["config"]["embedding_dim"]),
                         "image_size": int(saved["config"]["image_size"]), "state": saved["model"]}, model)
@@ -142,12 +161,27 @@ class Worker:
 
     def request(self, method: str, kind: str, body: bytes | None = None, **params) -> bytes:
         url = f"{self.url}/{kind}/{self.id}" + (f"?{urlencode(params)}" if params else "")
-        with urlopen(Request(url, data=body, method=method), timeout=300) as response:
-            return response.read()
+        for attempt in itertools.count():
+            try:
+                with urlopen(Request(url, data=body, method=method), timeout=TIMEOUT) as response:
+                    return response.read()
+            except HTTPError as error:
+                if error.code != 404 or kind == "model":
+                    raise
+                self.send_model()  # the worker restarted
+            except (URLError, OSError) as error:  # unreachable, refused, timed out
+                wait = min(RETRY_WAIT * 2 ** attempt, MAX_WAIT)
+                print(f"  worker unreachable ({error}); trying again in {wait}s", flush=True)
+                time.sleep(wait)
+        raise AssertionError("unreachable")
+
+    def embed(self, image_file: bytes) -> np.ndarray:
+        """systems.curtain_page of an image file (any format PIL reads), run on the worker."""
+        return np.load(io.BytesIO(self.request("POST", "page", image_file, grids=self.grids)))
 
     def page(self, page: dict) -> np.ndarray:
         # The page's file as it is: the worker reads it the way systems.page_grey does.
-        return np.load(io.BytesIO(self.request("POST", "page", (PAGES / page["path"]).read_bytes(), grids=self.grids)))
+        return self.embed((PAGES / page["path"]).read_bytes())
 
 
 if __name__ == "__main__":
